@@ -9,6 +9,7 @@ from .visualize import visualize as _visualize
 from .sonify import sonify as _sonify
 from .helpers import (
   run_inference,
+  run_batch_inference,
   expand_paths,
   check_paths,
   rmdir_if_empty,
@@ -32,6 +33,7 @@ def analyze(
   keep_byproducts: bool = False,
   overwrite: bool = False,
   multiprocess: bool = True,
+  batch_size: int = 1,
 ) -> Union[AnalysisResult, List[AnalysisResult]]:
   """
   Analyzes the provided audio files and returns the analysis results.
@@ -127,26 +129,51 @@ def analyze(
     )
 
     with torch.no_grad():
-      pbar = tqdm(zip(todo_paths, spec_paths), total=len(todo_paths))
-      for path, spec_path in pbar:
-        pbar.set_description(f'Analyzing {path.name}')
+      if batch_size <= 1:
+        # Original single-track inference path
+        pbar = tqdm(zip(todo_paths, spec_paths), total=len(todo_paths))
+        for path, spec_path in pbar:
+          pbar.set_description(f'Analyzing {path.name}')
 
-        result = run_inference(
-          path=path,
-          spec_path=spec_path,
-          model=model,
-          device=device,
-          include_activations=include_activations,
-          include_embeddings=include_embeddings,
-        )
+          result = run_inference(
+            path=path,
+            spec_path=spec_path,
+            model=model,
+            device=device,
+            include_activations=include_activations,
+            include_embeddings=include_embeddings,
+          )
 
-        # Save the result right after the inference.
-        # Checkpointing is always important for this kind of long-running tasks...
-        # for my mental health...
-        if out_dir is not None:
-          save_results(result, out_dir)
+          if out_dir is not None:
+            save_results(result, out_dir)
 
-        results.append(result)
+          results.append(result)
+      else:
+        # Batched inference path
+        num_batches = (len(todo_paths) + batch_size - 1) // batch_size
+        pbar = tqdm(total=len(todo_paths), desc='Analyzing')
+        for batch_idx in range(num_batches):
+          start = batch_idx * batch_size
+          end = min(start + batch_size, len(todo_paths))
+          batch_paths = todo_paths[start:end]
+          batch_spec_paths = spec_paths[start:end]
+
+          batch_results = run_batch_inference(
+            paths=batch_paths,
+            spec_paths=batch_spec_paths,
+            model=model,
+            device=device,
+            include_activations=include_activations,
+            include_embeddings=include_embeddings,
+          )
+
+          for result in batch_results:
+            if out_dir is not None:
+              save_results(result, out_dir)
+            results.append(result)
+
+          pbar.update(len(batch_paths))
+        pbar.close()
 
   # Sort the results by the original order of the tracks.
   results = sorted(results, key=lambda result: paths.index(result.path))

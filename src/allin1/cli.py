@@ -35,6 +35,8 @@ def make_parser():
                       help='Path to a directory to store spectrograms (default: ./spec)')
   parser.add_argument('--overwrite', action='store_true', default=False,
                       help='Overwrite existing files (default: False)')
+  parser.add_argument('--batch-size', type=int, default=1,
+                      help='Number of tracks to process per batch (default: 1)')
   parser.add_argument('--no-multiprocess', action='store_true', default=False,
                       help='Disable multiprocessing (default: False)')
 
@@ -64,6 +66,7 @@ def main():
     keep_byproducts=args.keep_byproducts,
     overwrite=args.overwrite,
     multiprocess=not args.no_multiprocess,
+    batch_size=args.batch_size,
   )
 
   print(f'=> Analysis results are successfully saved to {args.out_dir}')

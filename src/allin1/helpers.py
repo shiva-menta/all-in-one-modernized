@@ -1,11 +1,12 @@
 import numpy as np
 import json
 import torch
+import torch.nn.functional as F
 
 from dataclasses import asdict
 from pathlib import Path
 from glob import glob
-from typing import List, Union
+from typing import List, Tuple, Union
 from .utils import mkpath, compact_json_number_array
 from .typings import AllInOneOutput, AnalysisResult, PathLike
 from .postprocessing import (
@@ -60,6 +61,76 @@ def compute_activations(logits: AllInOneOutput):
     'segment': activations_segment,
     'label': activations_label,
   }
+
+
+def collate_spectrograms(
+  spec_paths: List[Path],
+  device: str,
+) -> Tuple[torch.Tensor, List[int]]:
+  """Load and pad spectrograms into a single batch tensor.
+
+  Returns the batched tensor [B, 4, T_max, 12] and a list of original lengths.
+  """
+  specs = [np.load(p) for p in spec_paths]
+  lengths = [s.shape[1] for s in specs]  # spec shape is [4, T, 12]
+  max_len = max(lengths)
+
+  padded = []
+  for spec in specs:
+    t = torch.from_numpy(spec)  # [4, T, 12]
+    pad_amount = max_len - t.shape[1]
+    if pad_amount > 0:
+      t = F.pad(t, (0, 0, 0, pad_amount))  # pad T dimension with zeros
+    padded.append(t)
+
+  batch = torch.stack(padded, dim=0).to(device)  # [B, 4, T_max, 12]
+  return batch, lengths
+
+
+def run_batch_inference(
+  paths: List[Path],
+  spec_paths: List[Path],
+  model: torch.nn.Module,
+  device: str,
+  include_activations: bool,
+  include_embeddings: bool,
+) -> List[AnalysisResult]:
+  """Run inference on a batch of tracks and return per-track results."""
+  batch, lengths = collate_spectrograms(spec_paths, device)
+
+  logits = model(batch)
+
+  results = []
+  for i, (path, orig_len) in enumerate(zip(paths, lengths)):
+    # Slice this track's logits to its original length, removing padding
+    track_logits = AllInOneOutput(
+      logits_beat=logits.logits_beat[i:i+1, :orig_len],
+      logits_downbeat=logits.logits_downbeat[i:i+1, :orig_len],
+      logits_section=logits.logits_section[i:i+1, :orig_len],
+      logits_function=logits.logits_function[i:i+1, :, :orig_len],
+      embeddings=logits.embeddings[i:i+1, :, :orig_len, :],
+    )
+
+    metrical_structure = postprocess_metrical_structure(track_logits, model.cfg)
+    functional_structure = postprocess_functional_structure(track_logits, model.cfg)
+    bpm = estimate_tempo_from_beats(metrical_structure['beats'])
+
+    result = AnalysisResult(
+      path=path,
+      bpm=bpm,
+      segments=functional_structure,
+      **metrical_structure,
+    )
+
+    if include_activations:
+      result.activations = compute_activations(track_logits)
+
+    if include_embeddings:
+      result.embeddings = track_logits.embeddings[0].cpu().numpy()
+
+    results.append(result)
+
+  return results
 
 
 def expand_paths(paths: List[Path]):

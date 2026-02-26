@@ -87,6 +87,38 @@ def collate_spectrograms(
   return batch, lengths
 
 
+def _postprocess_single_track(args):
+  """Worker function for parallel postprocessing."""
+  i, path, logits_data, model_cfg, include_activations, include_embeddings = args
+
+  # Reconstruct track logits from CPU tensors
+  track_logits = AllInOneOutput(
+    logits_beat=logits_data['logits_beat'],
+    logits_downbeat=logits_data['logits_downbeat'],
+    logits_section=logits_data['logits_section'],
+    logits_function=logits_data['logits_function'],
+    embeddings=logits_data['embeddings'],
+  )
+
+  metrical_structure = postprocess_metrical_structure(track_logits, model_cfg)
+  functional_structure = postprocess_functional_structure(track_logits, model_cfg)
+  bpm = estimate_tempo_from_beats(metrical_structure['beats'])
+
+  result = AnalysisResult(
+    path=path,
+    bpm=bpm,
+    segments=functional_structure,
+    **metrical_structure,
+  )
+
+  if include_activations:
+    result.activations = compute_activations(track_logits)
+  if include_embeddings:
+    result.embeddings = track_logits.embeddings[0].cpu().numpy()
+
+  return i, result
+
+
 def run_batch_inference(
   paths: List[Path],
   spec_paths: List[Path],
@@ -96,39 +128,34 @@ def run_batch_inference(
   include_embeddings: bool,
 ) -> List[AnalysisResult]:
   """Run inference on a batch of tracks and return per-track results."""
+  from concurrent.futures import ThreadPoolExecutor
+
   batch, lengths = collate_spectrograms(spec_paths, device)
 
+  # Batched GPU inference
   logits = model(batch)
 
-  results = []
+  # Prepare data for parallel postprocessing
+  postprocess_args = []
   for i, (path, orig_len) in enumerate(zip(paths, lengths)):
-    # Slice this track's logits to its original length, removing padding
-    track_logits = AllInOneOutput(
-      logits_beat=logits.logits_beat[i:i+1, :orig_len],
-      logits_downbeat=logits.logits_downbeat[i:i+1, :orig_len],
-      logits_section=logits.logits_section[i:i+1, :orig_len],
-      logits_function=logits.logits_function[i:i+1, :, :orig_len],
-      embeddings=logits.embeddings[i:i+1, :, :orig_len, :],
-    )
+    # Slice and move to CPU for parallel processing
+    track_logits_data = {
+      'logits_beat': logits.logits_beat[i:i+1, :orig_len].cpu(),
+      'logits_downbeat': logits.logits_downbeat[i:i+1, :orig_len].cpu(),
+      'logits_section': logits.logits_section[i:i+1, :orig_len].cpu(),
+      'logits_function': logits.logits_function[i:i+1, :, :orig_len].cpu(),
+      'embeddings': logits.embeddings[i:i+1, :, :orig_len, :].cpu(),
+    }
+    postprocess_args.append((
+      i, path, track_logits_data, model.cfg,
+      include_activations, include_embeddings
+    ))
 
-    metrical_structure = postprocess_metrical_structure(track_logits, model.cfg)
-    functional_structure = postprocess_functional_structure(track_logits, model.cfg)
-    bpm = estimate_tempo_from_beats(metrical_structure['beats'])
-
-    result = AnalysisResult(
-      path=path,
-      bpm=bpm,
-      segments=functional_structure,
-      **metrical_structure,
-    )
-
-    if include_activations:
-      result.activations = compute_activations(track_logits)
-
-    if include_embeddings:
-      result.embeddings = track_logits.embeddings[0].cpu().numpy()
-
-    results.append(result)
+  # Parallel postprocessing - one worker per track in batch
+  results = [None] * len(paths)
+  with ThreadPoolExecutor(max_workers=len(paths)) as executor:
+    for idx, result in executor.map(_postprocess_single_track, postprocess_args):
+      results[idx] = result
 
   return results
 
